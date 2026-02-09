@@ -1,0 +1,6 @@
+[language-server.slangd.config.slang]
+additionalSearchPaths = [
+  "./crates/uzu/src/backends/vulkan/kernel",
+]
+searchInAllWorkspaceDirectories = true
+
