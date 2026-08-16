@@ -334,7 +334,7 @@ impl<'a, B: Backend> LanguageModelStream<'a, B> {
             metrics.num_tokens_accepted += 1;
 
             DecodingState::ForwardPassPending(DecodingStatePending {
-                input_trie: TrieNode::new(0, 0),
+                input_trie: TrieNode::new(0, 0, 0.0),
                 full_accept: true,
                 pending,
                 capture_span,
@@ -576,10 +576,12 @@ impl<'a, B: Backend> LanguageModelStream<'a, B> {
                 root_token as u32,
                 self.model.decoder.embedding(),
                 DFlashTfmTreeShape {
-                    budget: speculation_batch,
+                    tree_budget: speculation_batch,
+                    max_depth: 16,
+                    dflash_depth: None,
                     construction_method: if speculator.has_weaver() {
                         DFlashTfmTreeConstructionMethod::Weaver {
-                            depth: 16,
+                            rounds: 20,
                             expand_per_round: 4,
                             expand_width: 4,
                         }
@@ -601,7 +603,7 @@ impl<'a, B: Backend> LanguageModelStream<'a, B> {
                 } => (*token, None),
                 ForwardPassChaining::InFlight(pending) => (0, Some(&pending.output_tokens)),
             };
-            (TrieNode::new(token, self.model_state.prng.derive(context_length as u64)), chain_copy, true)
+            (TrieNode::new(token, self.model_state.prng.derive(context_length as u64), 0.0), chain_copy, true)
         };
         let input_flat_trie = input_trie.linearize();
 

@@ -26,6 +26,7 @@ pub enum TrieAcceptError {
 pub struct TrieNode {
     token: u64,
     seed: u64,
+    logprob: f32,
     next: Vec<TrieNode>,
 }
 
@@ -45,10 +46,12 @@ impl TrieNode {
     pub fn new(
         token: u64,
         seed: u64,
+        logprob: f32,
     ) -> Self {
         Self {
             token,
             seed,
+            logprob,
             next: Vec::new(),
         }
     }
@@ -77,6 +80,99 @@ impl TrieNode {
         self.token
     }
 
+    #[cfg(test)]
+    pub fn logprob(&self) -> f32 {
+        self.logprob
+    }
+
+    #[cfg(test)]
+    pub fn node_count(&self) -> usize {
+        1 + self.next.iter().map(TrieNode::node_count).sum::<usize>()
+    }
+
+    pub fn prune_to_budget(
+        &mut self,
+        budget: usize,
+    ) {
+        assert!(budget > 0, "budget must keep at least the root");
+
+        fn collect_logprobs(
+            node: &TrieNode,
+            parent_logprob: f32,
+            logprobs: &mut Vec<f32>,
+        ) {
+            let logprob = parent_logprob + node.logprob;
+            logprobs.push(logprob);
+            for child in &node.next {
+                collect_logprobs(child, logprob, logprobs);
+            }
+        }
+        let mut logprobs = Vec::new();
+        collect_logprobs(self, 0.0, &mut logprobs);
+        if budget >= logprobs.len() {
+            return;
+        }
+
+        let mut order: Box<[usize]> = (0..logprobs.len()).collect();
+        order.sort_by(|&a, &b| logprobs[b].total_cmp(&logprobs[a]));
+        let mut kept = vec![false; logprobs.len()];
+        for &index in order.iter().take(budget) {
+            kept[index] = true;
+        }
+
+        fn prune(
+            node: &mut TrieNode,
+            kept: &[bool],
+            cursor: &mut usize,
+        ) {
+            *cursor += 1;
+            let mut children = std::mem::take(&mut node.next);
+            children.retain_mut(|child| {
+                let child_index = *cursor;
+                prune(child, kept, cursor);
+                kept[child_index]
+            });
+            node.next = children;
+        }
+        prune(self, &kept, &mut 0);
+    }
+
+    #[cfg(test)]
+    pub fn prune_by_logprob_threshold(
+        &mut self,
+        min_logprob: f32,
+    ) {
+        fn prune(
+            node: &mut TrieNode,
+            parent_logprob: f32,
+            min_logprob: f32,
+        ) {
+            node.next.retain_mut(|child| {
+                let logprob = parent_logprob + child.logprob;
+                let keep = logprob >= min_logprob;
+                if keep {
+                    prune(child, logprob, min_logprob);
+                }
+                keep
+            });
+        }
+        prune(self, 0.0, min_logprob);
+    }
+
+    #[cfg(test)]
+    pub fn prune_to_depth(
+        &mut self,
+        max_depth: usize,
+    ) {
+        if max_depth == 0 {
+            self.next.clear();
+            return;
+        }
+        for child in &mut self.next {
+            child.prune_to_depth(max_depth - 1);
+        }
+    }
+
     pub fn flat(
         prefix_length: usize,
         tokens: &[u64],
@@ -84,11 +180,11 @@ impl TrieNode {
     ) -> Self {
         assert!(!tokens.is_empty(), "need seed node");
 
-        let mut root = TrieNode::new(tokens[0], prng.derive(prefix_length as u64));
+        let mut root = TrieNode::new(tokens[0], prng.derive(prefix_length as u64), 0.0);
         let mut leaf = &mut root;
 
         for (index, token) in tokens.iter().copied().enumerate().skip(1) {
-            leaf.add(TrieNode::new(token, prng.derive((prefix_length + index) as u64))).unwrap();
+            leaf.add(TrieNode::new(token, prng.derive((prefix_length + index) as u64), 0.0)).unwrap();
             leaf = &mut leaf.next[0];
         }
 
