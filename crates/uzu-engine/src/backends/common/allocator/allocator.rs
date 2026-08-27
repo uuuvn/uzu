@@ -78,6 +78,7 @@ impl<B: Backend> Drop for Allocation<B> {
 }
 
 pub struct AllocationPool<B: Backend> {
+    #[expect(unused)]
     reusable: bool,
     allocator: Arc<Allocator<B>>,
     pool_number: usize,
@@ -131,11 +132,12 @@ impl<B: Backend> Allocator<B> {
             AllocationType::Global => RangeAllocationType::Global,
             AllocationType::Pooled {
                 pool,
-                cpu_available,
+                cpu_available: _,
             } => RangeAllocationType::Pooled {
                 pool: pool.pool_number,
-                can_alias_before: !cpu_available,
-                can_alias_after: !(cpu_available && pool.reusable),
+                // BUG: WTF?
+                can_alias_before: false,
+                can_alias_after: false,
             },
         };
 
