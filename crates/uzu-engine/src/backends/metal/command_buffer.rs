@@ -1,6 +1,6 @@
 use std::{
     range::Range,
-    sync::{Arc, mpsc},
+    sync::{Arc, Mutex, mpsc},
     time::Duration,
 };
 
@@ -8,6 +8,7 @@ use metal::{
     MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTL4CommandAllocator, MTL4CommandBuffer, MTL4CommandBufferExt,
     MTL4CommandEncoder, MTL4CommandEncoderExt, MTL4CommandQueueExt, MTL4CommitFeedback, MTL4CommitFeedbackExt,
     MTL4CommitFeedbackHandler, MTL4CommitOptions, MTL4ComputeCommandEncoder, MTL4ComputeCommandEncoderExt,
+    MTL4CounterHeap, MTL4CounterHeapDescriptor, MTL4CounterHeapExt, MTL4CounterHeapType, MTL4TimestampGranularity,
     MTL4VisibilityOptions, MTLDeviceExt, MTLStages,
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
@@ -18,7 +19,10 @@ use crate::backends::{
         Backend, BufferMut, BufferRef, CommandBuffer, CommandBufferCompleted, CommandBufferEncoding,
         CommandBufferExecutable, CommandBufferPending, Context, allocator::bump::BumpAllocator,
     },
-    metal::{Metal, MetalContext, buffer::MetalBufferExt, error::MetalError},
+    metal::{
+        Metal, MetalContext, buffer::MetalBufferExt, error::MetalError,
+        kernel_timestamps::{self, KernelTiming, KernelTimingBatch},
+    },
 };
 
 pub struct MetalCommandBuffer;
@@ -37,6 +41,104 @@ pub(super) struct Access {
     pub(super) write: bool,
 }
 
+/// Per-command-buffer state for precise per-kernel GPU timestamps.
+/// See [`crate::backends::metal::kernel_timestamps`].
+pub(super) struct KernelTimestamps {
+    heap: Retained<ProtocolObject<dyn MTL4CounterHeap>>,
+    next_index: usize,
+    names: Vec<&'static str>,
+    /// True when `begin` wrote a stamp and the matching `end` is still owed.
+    pending: bool,
+}
+
+// SAFETY: the heap is written by the GPU while the command buffer is in flight
+// and read on the CPU only after completion. MTL objects are thread-safe.
+unsafe impl Send for KernelTimestamps {}
+unsafe impl Sync for KernelTimestamps {}
+
+impl KernelTimestamps {
+    /// Heap entries; two stamps per kernel dispatch. The driver rejects heaps
+    /// larger than 4096 entries (32 KiB), so this caps at 2048 kernels per
+    /// command buffer; dispatches beyond that go unstamped.
+    const CAPACITY: usize = 4096;
+
+    fn new(context: &MetalContext) -> Option<Self> {
+        let descriptor = MTL4CounterHeapDescriptor::new();
+        descriptor.set_type(MTL4CounterHeapType::TIMESTAMP);
+        descriptor.set_count(Self::CAPACITY);
+        let heap = context
+            .device
+            .new_counter_heap_with_descriptor(&descriptor)
+            .expect("failed to allocate timestamp counter heap");
+        Some(Self {
+            heap,
+            next_index: 0,
+            names: Vec::new(),
+            pending: false,
+        })
+    }
+
+    fn begin(
+        &mut self,
+        compute_encoder: &ProtocolObject<dyn MTL4ComputeCommandEncoder>,
+        name: &'static str,
+    ) {
+        if self.pending || self.next_index + 2 > Self::CAPACITY {
+            return;
+        }
+        compute_encoder.write_timestamp_with_granularity_into_heap_at_index(
+            MTL4TimestampGranularity::PRECISE,
+            &self.heap,
+            self.next_index,
+        );
+        self.next_index += 1;
+        self.names.push(name);
+        self.pending = true;
+    }
+
+    fn end(
+        &mut self,
+        compute_encoder: &ProtocolObject<dyn MTL4ComputeCommandEncoder>,
+    ) {
+        if !self.pending {
+            return;
+        }
+        compute_encoder.write_timestamp_with_granularity_into_heap_at_index(
+            MTL4TimestampGranularity::PRECISE,
+            &self.heap,
+            self.next_index,
+        );
+        self.next_index += 1;
+        self.pending = false;
+    }
+
+    /// Resolve the heap (GPU work must be complete) and record per-kernel durations.
+    fn resolve_and_record(
+        self,
+        timestamp_frequency_hz: u64,
+        feedback_gpu_time_ns: u64,
+    ) {
+        let count = self.names.len().min(self.next_index / 2);
+        if count == 0 {
+            return;
+        }
+        let Some(data) = self.heap.resolve_counter_range(0..count * 2) else { return };
+        let stamps: Vec<u64> = data.as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c)).collect();
+        let kernels = (0..count)
+            .map(|i| KernelTiming {
+                name: self.names[i],
+                duration_ticks: stamps[2 * i + 1].saturating_sub(stamps[2 * i]),
+            })
+            .collect();
+        kernel_timestamps::record(KernelTimingBatch {
+            feedback_gpu_time_ns,
+            timestamp_frequency_hz,
+            span_ticks: (stamps[0], stamps[count * 2 - 1]),
+            kernels,
+        });
+    }
+}
+
 pub struct MetalCommandBufferEncoding {
     command_allocator: Retained<ProtocolObject<dyn MTL4CommandAllocator>>,
     command_buffer: Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
@@ -46,6 +148,7 @@ pub struct MetalCommandBufferEncoding {
     writes: RangeSet<u64>,
     constant_allocator: Option<BumpAllocator<<Metal as Backend>::GlobalBuffer>>,
     allocation_pool: Arc<<Metal as Backend>::AllocationPool>,
+    kernel_timestamps: Option<KernelTimestamps>,
     pub(super) context: Arc<MetalContext>,
 }
 
@@ -91,6 +194,12 @@ impl MetalCommandBufferEncoding {
 
         let allocation_pool = allocation_pool.unwrap_or_else(|| context.create_allocation_pool());
 
+        let kernel_timestamps = if kernel_timestamps::is_enabled() {
+            KernelTimestamps::new(&context)
+        } else {
+            None
+        };
+
         Ok(Self {
             command_allocator,
             command_buffer,
@@ -100,8 +209,30 @@ impl MetalCommandBufferEncoding {
             writes: RangeSet::new(),
             constant_allocator: Some(constant_allocator),
             allocation_pool,
+            kernel_timestamps,
             context,
         })
+    }
+
+    /// Stamps the GPU timeline before a kernel dispatch. No-op unless kernel
+    /// timestamp instrumentation is enabled (see [`kernel_timestamps`]).
+    /// Called from generated kernel encode functions.
+    #[inline]
+    pub fn kernel_timestamp_begin(
+        &mut self,
+        name: &'static str,
+    ) {
+        if let Some(timestamps) = self.kernel_timestamps.as_mut() {
+            timestamps.begin(&self.compute_encoder, name);
+        }
+    }
+
+    /// Stamps the GPU timeline after a kernel dispatch. See [`Self::kernel_timestamp_begin`].
+    #[inline]
+    pub fn kernel_timestamp_end(&mut self) {
+        if let Some(timestamps) = self.kernel_timestamps.as_mut() {
+            timestamps.end(&self.compute_encoder);
+        }
     }
 
     pub(super) fn access(
@@ -222,6 +353,7 @@ impl CommandBufferEncoding for MetalCommandBufferEncoding {
             command_buffer: self.command_buffer.clone(),
             constant_allocator,
             allocation_pool: self.allocation_pool.clone(),
+            kernel_timestamps: self.kernel_timestamps.take(),
             context: self.context.clone(),
         }
     }
@@ -244,6 +376,7 @@ pub struct MetalCommandBufferExecutable {
     command_buffer: Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
     constant_allocator: BumpAllocator<<Metal as Backend>::GlobalBuffer>,
     allocation_pool: Arc<<Metal as Backend>::AllocationPool>,
+    kernel_timestamps: Option<KernelTimestamps>,
     context: Arc<MetalContext>,
 }
 
@@ -259,12 +392,18 @@ impl CommandBufferExecutable for MetalCommandBufferExecutable {
 
         let constant_allocator = self.constant_allocator;
         let allocation_pool = self.allocation_pool.clone();
+        let timestamp_frequency_hz = self.context.device.query_timestamp_frequency();
+        let kernel_timestamps = Mutex::new(self.kernel_timestamps);
         let feedback_handler = move |feedback: &ProtocolObject<dyn MTL4CommitFeedback>| {
             let message = if let Some(error) = feedback.error() {
                 Err(error.to_string())
             } else {
                 Ok(Duration::from_secs_f64(feedback.gpu_end_time() - feedback.gpu_start_time()))
             };
+            if let Some(timestamps) = kernel_timestamps.lock().expect("kernel timings lock poisoned").take() {
+                let gpu_time_ns = message.as_ref().map(|d| d.as_nanos() as u64).unwrap_or(0);
+                timestamps.resolve_and_record(timestamp_frequency_hz, gpu_time_ns);
+            }
             let _ = sender.send(message);
             context_clone.command_buffer_cache.lock().push(MetalCommandBufferCache {
                 command_allocator: command_allocator.clone(),

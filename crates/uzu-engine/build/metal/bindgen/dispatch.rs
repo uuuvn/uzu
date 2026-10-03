@@ -35,6 +35,16 @@ pub fn parse(
 
     let empty_dispatch_guards = build_empty_dispatch_guards(&dispatch_size_expressions);
 
+    // Bracket every dispatch with precise GPU timestamps when the runtime
+    // instrumentation is enabled (no-op otherwise). See
+    // src/backends/metal/kernel_timestamps.rs.
+    let kernel_name = kernel.name.as_ref();
+    let dispatch_code = quote! {
+        command_buffer.kernel_timestamp_begin(#kernel_name);
+        #dispatch_code
+        command_buffer.kernel_timestamp_end();
+    };
+
     Ok(DispatchEmission {
         dispatch_code,
         empty_dispatch_guards,

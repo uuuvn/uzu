@@ -5,6 +5,7 @@ mod context;
 mod decompression;
 mod error;
 mod kernel;
+pub mod kernel_timestamps;
 mod metal_extensions;
 
 pub use backend::Metal;
