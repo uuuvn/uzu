@@ -6,6 +6,7 @@ mod decompression;
 mod error;
 mod kernel;
 mod metal_extensions;
+mod shader_cache;
 
 pub use backend::Metal;
 pub use context::MetalContext; // TODO: This should be removed

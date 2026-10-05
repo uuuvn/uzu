@@ -15,22 +15,26 @@ use metal::{
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use parking_lot::{Mutex, MutexGuard};
 
-use crate::backends::{
-    common::{
-        Backend, Context, DeviceCapabilities,
-        allocator::{block::BlockAllocator, pool::PoolAllocator},
-    },
-    metal::{
-        Metal,
-        buffer::{
-            dense::MetalDenseBuffer,
-            sparse::{MetalSparseBuffer, MetalSparseHeapPool, MetalSparseMappingOpsBatch},
+use crate::{
+    backends::{
+        common::{
+            Backend, Context, DeviceCapabilities,
+            allocator::{block::BlockAllocator, pool::PoolAllocator},
         },
-        command_buffer::{MetalCommandBufferCache, MetalCommandBufferEncoding},
-        decompression,
-        error::MetalError,
-        metal_extensions::{DeviceExt, LibraryPipelineExtensions},
+        metal::{
+            Metal,
+            buffer::{
+                dense::MetalDenseBuffer,
+                sparse::{MetalSparseBuffer, MetalSparseHeapPool, MetalSparseMappingOpsBatch},
+            },
+            command_buffer::{MetalCommandBufferCache, MetalCommandBufferEncoding},
+            decompression,
+            error::MetalError,
+            metal_extensions::{DeviceExt, LibraryPipelineExtensions},
+            shader_cache,
+        },
     },
+    utils::load_metrics::{self, LoadMetric},
 };
 
 pub(super) const LARGE_MIN_GPU_CORES: u32 = 30;
@@ -76,10 +80,12 @@ impl MetalContext {
             data
         };
 
-        let library = self
-            .device
-            .new_library_with_data(data)
-            .map_err(|nserror| MetalError::CannotCreateLibrary(nserror.to_string()))?;
+        let library = {
+            let _guard = load_metrics::record(LoadMetric::MetalLibrary);
+            self.device
+                .new_library_with_data(data)
+                .map_err(|nserror| MetalError::CannotCreateLibrary(nserror.to_string()))?
+        };
         self.library_cache.lock().insert(key, library.clone());
 
         Ok(library)
@@ -97,8 +103,12 @@ impl MetalContext {
             return Ok(pipeline.clone());
         }
 
-        let pipeline =
-            self.library(library_data, library_compressed)?.compute_pipeline_state(function_name, constants)?;
+        let library = self.library(library_data, library_compressed)?;
+        let pipeline = {
+            let _guard = load_metrics::record(LoadMetric::MetalPipelineState);
+            library.compute_pipeline_state(function_name, constants)?
+        };
+        load_metrics::record_creation(cache_key);
         self.pipeline_cache.lock().insert(cache_key.to_string(), pipeline.clone());
 
         Ok(pipeline)
@@ -122,6 +132,10 @@ impl Context for MetalContext {
     type Backend = Metal;
 
     fn new() -> Result<Arc<Self>, MetalError> {
+        // Must run before the first Metal device is created, Metal ignores
+        // shader cache redirections that happen after its cache is initialized.
+        shader_cache::bypass_if_requested();
+
         let device = <dyn MTLDevice>::system_default().ok_or(MetalError::CannotOpenDevice)?;
         let device_name = device.name();
         let gpu_core_count = device.gpu_core_count();

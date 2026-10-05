@@ -15,7 +15,10 @@ pub mod data_type;
 
 pub mod engine;
 
-pub use utils::version::{TOOLCHAIN_VERSION, VERSION};
+pub use utils::{
+    load_metrics,
+    version::{TOOLCHAIN_VERSION, VERSION},
+};
 
 #[cfg(test)]
 #[path = "../unit/common/mod.rs"]

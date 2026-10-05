@@ -16,7 +16,10 @@ use crate::{
     array::{ArrayElement, size_for_shape},
     backends::common::{Backend, BufferMut, Context},
     data_type::DataType,
-    utils::strict_serde::DeserializeStrictOwned,
+    utils::{
+        load_metrics::{self, LoadMetric},
+        strict_serde::DeserializeStrictOwned,
+    },
 };
 
 struct ParameterMetadata {
@@ -129,14 +132,20 @@ impl<'a, 'leaf, B: Backend> ParameterLeaf<'a, 'leaf, B, true> {
         let element_count = self.metadata.size / std::mem::size_of::<T>();
         let mut data = vec![T::zeroed(); element_count];
         let destination = bytemuck::cast_slice_mut(&mut data);
-        self.loader.file.read_exact_at(destination, self.metadata.offset as u64)?;
+        {
+            let _guard = load_metrics::record(LoadMetric::WeightsDiskRead);
+            self.loader.file.read_exact_at(destination, self.metadata.offset as u64)?;
+        }
         Ok(data.into_boxed_slice())
     }
 
     pub fn read_buffer(&self) -> Result<B::GlobalBuffer, ParameterLoaderError<B>> {
         let mut buffer =
             self.loader.context.create_buffer(self.metadata.size).map_err(ParameterLoaderError::BackendError)?;
-        self.loader.file.read_exact_at(buffer.as_slice_mut::<u8>(), self.metadata.offset as u64)?;
+        {
+            let _guard = load_metrics::record(LoadMetric::WeightsDiskRead);
+            self.loader.file.read_exact_at(buffer.as_slice_mut::<u8>(), self.metadata.offset as u64)?;
+        }
         Ok(buffer)
     }
 }

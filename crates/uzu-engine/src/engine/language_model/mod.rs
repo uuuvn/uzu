@@ -18,6 +18,7 @@ use crate::{
     engine::Engine,
     parameters::{ParameterLoader, ParameterLoaderError},
     speculators::dflash_tfm::{DFlashSpeculatorLoadError, DFlashTfmSpeculator},
+    utils::load_metrics::{self, LoadMetric},
 };
 
 pub mod state;
@@ -72,16 +73,22 @@ impl<B: Backend> Engine<B> {
         let speculator_path = model_path.join("speculator");
         let speculator_path = speculator_path.exists().then_some(speculator_path);
 
-        let tokenizer = Arc::new(Tokenizer::from_file(model_path.join("tokenizer.json"))?);
+        let tokenizer = {
+            let _guard = load_metrics::record(LoadMetric::Tokenizer);
+            Arc::new(Tokenizer::from_file(model_path.join("tokenizer.json"))?)
+        };
 
         let data_type = DataType::BF16;
 
-        let decoder = Decoder::new(
-            self.context.as_ref(),
-            &config.decoder_config,
-            &weight_loader.tree().subtree("decoder"),
-            data_type,
-        )?;
+        let decoder = {
+            let _guard = load_metrics::record(LoadMetric::Decoder);
+            Decoder::new(
+                self.context.as_ref(),
+                &config.decoder_config,
+                &weight_loader.tree().subtree("decoder"),
+                data_type,
+            )?
+        };
 
         assert!(
             speculator_path.is_none() || decoder.speculation_supported(),
